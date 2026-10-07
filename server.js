@@ -3,6 +3,11 @@ const { XMLParser } = require('fast-xml-parser');
 const { CHANNELS } = require('./channels');
 
 const app = express();
+app.use((_req, res, next) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  next();
+});
+app.use('/posters', express.static(require('path').join(__dirname, 'public/posters'), { maxAge: '1d' }));
 const PORT = process.env.PORT || 7000;
 
 const SOURCES = [
@@ -17,7 +22,7 @@ const EPG_SOURCES = [
 
 const manifest = {
   id: 'my.malaysia.free.live.tv',
-  version: '1.0.0',
+  version: '1.0.1',
   name: 'Malaysia Free Live TV',
   description: 'Free Malaysian live TV for Nuvio/Stremio using public/official stream sources and AqFad2811 XMLTV EPG.',
   resources: ['catalog', 'meta', 'stream'],
@@ -67,9 +72,15 @@ function parseM3U(text) {
         tvgId: attrs['tvg-id'] || '',
         logo: attrs['tvg-logo'] || '',
         group: attrs['group-title'] || '',
-        requestHeaders: {}
+        requestHeaders: {},
+        requiresDrm: false
       };
       requestHeaders = {};
+      continue;
+    }
+
+    if (line.startsWith('#KODIPROP:inputstream.adaptive.license_type=')) {
+      if (pending) pending.requiresDrm = true;
       continue;
     }
 
@@ -87,15 +98,19 @@ function parseM3U(text) {
       if (url.includes('|')) {
         const [base, optString] = url.split('|', 2);
         url = base;
-        for (const pair of optString.split('&')) {
+        for (const pair of optString.split(/&(?=(?:Referer|Referrer|User-Agent|Origin)=)/i)) {
           const [k, ...rest] = pair.split('=');
           if (!k || !rest.length) continue;
-          const v = rest.join('=');
-          if (/^referer$/i.test(k)) requestHeaders.Referer = v;
+          let v = rest.join('=');
+          try { v = decodeURIComponent(v); } catch (_) {}
+          if (/^referr?er$/i.test(k)) requestHeaders.Referer = v;
           if (/^user-agent$/i.test(k)) requestHeaders['User-Agent'] = v;
+          if (/^origin$/i.test(k)) requestHeaders.Origin = v;
         }
       }
-      out.push({ ...pending, url, requestHeaders: { ...requestHeaders } });
+      if (/^https?:\/\//i.test(url) && !pending.requiresDrm) {
+        out.push({ ...pending, url, requestHeaders: { ...requestHeaders } });
+      }
       pending = null;
       requestHeaders = {};
     }
@@ -106,15 +121,16 @@ function parseM3U(text) {
 function chooseAllowed(rawChannels) {
   const selected = [];
   for (const def of CHANNELS) {
-    const hit = rawChannels.find(ch => def.aliases.some(a => a.toLowerCase() === ch.name.toLowerCase()));
-    if (!hit) continue;
-    selected.push({
-      ...def,
-      url: hit.url,
-      logo: hit.logo,
-      sourceGroup: hit.group,
-      requestHeaders: hit.requestHeaders || {}
-    });
+    const hits = rawChannels.filter(ch => def.aliases.some(a => a.toLowerCase() === ch.name.toLowerCase()));
+    const seen = new Set();
+    const streams = hits.filter(hit => {
+      const key = JSON.stringify([hit.url, hit.requestHeaders]);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).sort((a, b) => Number(/\.m3u8(?:[?]|$)/i.test(b.url)) - Number(/\.m3u8(?:[?]|$)/i.test(a.url)));
+    if (!streams.length) continue;
+    selected.push({ ...def, logo: hits.find(ch => ch.logo)?.logo || '', streams });
   }
   return selected;
 }
@@ -125,14 +141,15 @@ async function getChannels() {
   const all = [];
   for (const src of SOURCES) {
     try {
-      const r = await fetch(src, { headers: { 'User-Agent': 'Mozilla/5.0 Nuvio-Malaysia-Live/1.0' } });
+      const r = await fetch(src, { signal: AbortSignal.timeout(10000), headers: { 'User-Agent': 'Mozilla/5.0 Nuvio-Malaysia-Live/1.0' } });
       if (!r.ok) continue;
       all.push(...parseM3U(await r.text()));
     } catch (_) {}
   }
 
-  const channels = chooseAllowed(all);
-  playlistCache = { expires: Date.now() + 10 * 60 * 1000, channels };
+  const fresh = chooseAllowed(all);
+  const channels = fresh.length ? fresh : playlistCache.channels;
+  playlistCache = { expires: Date.now() + (fresh.length ? 10 * 60 * 1000 : 30000), channels };
   return channels;
 }
 
@@ -162,7 +179,7 @@ async function getEpg() {
 
   for (const src of EPG_SOURCES) {
     try {
-      const r = await fetch(src, { headers: { 'User-Agent': 'Mozilla/5.0 Nuvio-Malaysia-Live/1.0' } });
+      const r = await fetch(src, { signal: AbortSignal.timeout(10000), headers: { 'User-Agent': 'Mozilla/5.0 Nuvio-Malaysia-Live/1.0' } });
       if (!r.ok) continue;
       const xml = await r.text();
       const obj = parser.parse(xml);
@@ -207,13 +224,23 @@ function formatTime(d) {
   }).format(d);
 }
 
-function metaBase(ch) {
+function publicBase(req) {
+  const configured = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+  if (configured) return configured;
+  // Render terminates HTTPS before forwarding to this process.
+  const protocol = req.get('x-forwarded-proto')?.split(',')[0].trim() === 'https' ? 'https' : req.protocol;
+  return `${protocol}://${req.get('host')}`;
+}
+
+function metaBase(ch, baseUrl) {
   return {
     id: `mytv:${slugify(ch.name)}`,
     type: 'tv',
     name: ch.name,
-    poster: ch.logo || undefined,
-    posterShape: 'square',
+    poster: `${baseUrl}/posters/${slugify(ch.name)}.png`,
+    background: `${baseUrl}/posters/${slugify(ch.name)}.png`,
+    logo: ch.logo || undefined,
+    posterShape: 'landscape',
     genres: [ch.group, 'Live TV', 'Malaysia'],
     releaseInfo: 'Live'
   };
@@ -225,9 +252,9 @@ app.get('/', (_req, res) => {
 
 app.get('/manifest.json', (_req, res) => res.json(manifest));
 
-app.get('/catalog/tv/malaysia-free-live.json', async (_req, res) => {
+app.get('/catalog/tv/malaysia-free-live.json', async (req, res) => {
   const channels = await getChannels();
-  res.json({ metas: channels.map(metaBase) });
+  res.json({ metas: channels.map(ch => metaBase(ch, publicBase(req))) });
 });
 
 app.get('/meta/tv/:id.json', async (req, res) => {
@@ -244,7 +271,7 @@ app.get('/meta/tv/:id.json', async (req, res) => {
 
   res.json({
     meta: {
-      ...metaBase(ch),
+      ...metaBase(ch, publicBase(req)),
       description: lines.join('\n'),
       videos: [{ id: `mytv:${slugify(ch.name)}`, title: ch.name, released: new Date().toISOString() }]
     }
@@ -256,19 +283,7 @@ app.get('/stream/tv/:id.json', async (req, res) => {
   const ch = channels.find(x => `mytv:${slugify(x.name)}` === req.params.id);
   if (!ch) return res.json({ streams: [] });
 
-  const behaviorHints = { notWebReady: true };
-  if (ch.requestHeaders && Object.keys(ch.requestHeaders).length) {
-    behaviorHints.proxyHeaders = { request: ch.requestHeaders };
-  }
-
-  res.json({
-    streams: [{
-      name: 'Malaysia Free Live TV',
-      title: ch.name,
-      url: ch.url,
-      behaviorHints
-    }]
-  });
+  res.json({ streams: ch.streams.map((source, index) => streamBase(ch, source, index)) });
 });
 
 app.get('/health', async (_req, res) => {
@@ -280,4 +295,16 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-app.listen(PORT, () => console.log(`Malaysia Free Live TV addon listening on :${PORT}`));
+function streamBase(ch, source, index) {
+  const behaviorHints = { notWebReady: true };
+  if (Object.keys(source.requestHeaders || {}).length) {
+    behaviorHints.proxyHeaders = { request: source.requestHeaders };
+  }
+  const format = /\.m3u8(?:[?]|$)/i.test(source.url) ? 'HLS' : /\.mpd(?:[?]|$)/i.test(source.url) ? 'DASH' : 'Live';
+  return { name: 'Malaysia Free Live TV', title: `${ch.name} • ${format} • Source ${index + 1}`, url: source.url, behaviorHints };
+}
+
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`Malaysia Free Live TV addon listening on :${PORT}`));
+}
+module.exports = { app, parseM3U, chooseAllowed, metaBase, streamBase };

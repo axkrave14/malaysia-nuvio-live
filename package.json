@@ -1,11 +1,12 @@
 {
   "name": "malaysia-nuvio-live",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Nuvio/Stremio-compatible addon for free Malaysian live TV with XMLTV EPG.",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"
